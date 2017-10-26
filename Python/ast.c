@@ -4045,6 +4045,224 @@ ast_for_classdef(struct compiling *c, const node *n, asdl_seq *decorator_seq)
     return ast_for_update_classdef(c, n, classname, call, s, decorator_seq, docstring);
 }
 
+/* return 1 if the given name exists in exprs */
+static int
+is_name_in_exprs(const identifier name, const asdl_seq* exprs)
+{
+    int i;
+    for (i = 0; i < asdl_seq_LEN(exprs); i++) {
+        expr_ty ex = asdl_seq_GET(exprs, i);
+        if (ex->kind == Name_kind && PyUnicode_Compare(name, ex->v.Name.id) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* return 1 if the given name exists in stmts */
+static int
+is_name_in_stmts(const identifier name, const asdl_seq* stmts)
+{
+    int i;
+    identifier id = NULL;
+    for (i = 0; i < asdl_seq_LEN(stmts); i++) {
+        stmt_ty st = asdl_seq_GET(stmts, i);
+        switch (st->kind) {
+            case Assign_kind:
+                if (is_name_in_exprs(name, st->v.Assign.targets))
+                    return 1;
+                break;
+            case AnnAssign_kind:
+                if ((st->v.AnnAssign.target)->kind == Name_kind && PyUnicode_Compare(name, (st->v.AnnAssign.target)->v.Name.id) == 0)
+                    return 1;
+                break;
+            case FunctionDef_kind:
+                id = st->v.FunctionDef.name;
+                break;
+            case AsyncFunctionDef_kind:
+                id = st->v.AsyncFunctionDef.name;
+                break;
+            case ClassDef_kind:
+                id = st->v.ClassDef.name;
+                break;
+            default:
+                continue;
+        }
+        if (id != NULL && PyUnicode_Compare(name, id) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void add_self_in_comprehension(struct compiling *c, const node *n, asdl_seq*, const asdl_seq*);
+static void add_self_in_exprs(struct compiling *c, const node *n, asdl_seq*, const asdl_seq*);
+static void add_self_in_keywords(struct compiling *c, const node *n, asdl_seq*, const asdl_seq*);
+/* find the names in the given expr, and add self if they are defined in class body */
+static expr_ty
+add_self_for_member_access(struct compiling *c, const node *n, expr_ty ex, const asdl_seq* clazz)
+{
+    expr_ty e;
+    switch (ex->kind) {
+        case BoolOp_kind:
+            add_self_in_exprs(c, n, ex->v.BoolOp.values, clazz);
+            break;
+        case BinOp_kind:
+            e = add_self_for_member_access(c, n, ex->v.BinOp.left, clazz);
+            if (e)
+                ex->v.BinOp.left = e;
+            e = add_self_for_member_access(c, n, ex->v.BinOp.right, clazz);
+            if (e)
+                ex->v.BinOp.right = e;
+            break;
+        case UnaryOp_kind:
+            e = add_self_for_member_access(c, n, ex->v.UnaryOp.operand, clazz);
+            if (e)
+                ex->v.UnaryOp.operand = e;
+            break;
+        case Lambda_kind:
+            e = add_self_for_member_access(c, n, ex->v.Lambda.body, clazz);
+            if (e)
+                ex->v.Lambda.body = e;
+            break;
+        case IfExp_kind:
+            /* cannot write test here since it will be expanded
+             * add_self_for_member_access(c, n, ex->v.IfExp.test, clazz);
+             */
+            e = add_self_for_member_access(c, n, ex->v.IfExp.body, clazz);
+            if (e)
+                ex->v.IfExp.body = e;
+            e = add_self_for_member_access(c, n, ex->v.IfExp.orelse, clazz);
+            if (e)
+                ex->v.IfExp.orelse = e;
+            break;
+        case Dict_kind:
+            add_self_in_exprs(c, n, ex->v.Dict.keys, clazz);
+            add_self_in_exprs(c, n, ex->v.Dict.values, clazz);
+            break;
+        case Set_kind:
+            add_self_in_exprs(c, n, ex->v.Set.elts, clazz);
+            break;
+        case ListComp_kind:
+            e = add_self_for_member_access(c, n, ex->v.ListComp.elt, clazz);
+            if (e)
+                ex->v.ListComp.elt = e;
+            add_self_in_comprehension(c, n, ex->v.ListComp.generators, clazz);
+            break;
+        case SetComp_kind:
+            e = add_self_for_member_access(c, n, ex->v.SetComp.elt, clazz);
+            if (e)
+                ex->v.SetComp.elt = e;
+            add_self_in_comprehension(c, n, ex->v.SetComp.generators, clazz);
+            break;
+        case DictComp_kind:
+            e = add_self_for_member_access(c, n, ex->v.DictComp.key, clazz);
+            if (e)
+                ex->v.DictComp.key = e;
+            e = add_self_for_member_access(c, n, ex->v.DictComp.value, clazz);
+            if (e)
+                ex->v.DictComp.value = e;
+            add_self_in_comprehension(c, n, ex->v.DictComp.generators, clazz);
+            break;
+        case GeneratorExp_kind:
+            e = add_self_for_member_access(c, n, ex->v.GeneratorExp.elt, clazz);
+            if (e)
+                ex->v.GeneratorExp.elt = e;
+            add_self_in_comprehension(c, n, ex->v.GeneratorExp.generators, clazz);
+            break;
+        case Compare_kind:
+            e = add_self_for_member_access(c, n, ex->v.Compare.left, clazz);
+            if (e)
+                ex->v.Compare.left = e;
+            add_self_in_exprs(c, n, ex->v.Compare.comparators, clazz);
+            break;
+        case Call_kind:
+            e = add_self_for_member_access(c, n, ex->v.Call.func, clazz);
+            if (e)
+                ex->v.Call.func = e;
+            add_self_in_exprs(c, n, ex->v.Call.args, clazz);
+            add_self_in_keywords(c, n, ex->v.Call.keywords, clazz);
+            break;
+        case FormattedValue_kind:
+            e = add_self_for_member_access(c, n, ex->v.FormattedValue.value, clazz);
+            if (e)
+                ex->v.FormattedValue.value = e;
+            e = add_self_for_member_access(c, n, ex->v.FormattedValue.format_spec, clazz);
+            if (e)
+                ex->v.FormattedValue.format_spec = e;
+            break;
+        case Subscript_kind:
+            e = add_self_for_member_access(c, n, ex->v.Subscript.value, clazz);
+            if (e)
+                ex->v.Subscript.value = e;
+            break;
+        case Starred_kind:
+            e = add_self_for_member_access(c, n, ex->v.Starred.value, clazz);
+            if (e)
+                ex->v.Starred.value = e;
+            break;
+        case Name_kind:
+            if (is_name_in_stmts(ex->v.Name.id, clazz)) {
+                /* replace Name(id) with Attribute(self, id) */
+                D(printf("add_self_for_member_access: prepending self to an identifier: %ls\n", PyUnicode_AS_UNICODE(ex->v.Name.id)));
+                expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+                return Attribute(self, ex->v.Name.id, Load, LINENO(n), n->n_col_offset, c->c_arena);
+            }
+            break;
+        case List_kind:
+            add_self_in_exprs(c, n, ex->v.List.elts, clazz);
+            break;
+        case Tuple_kind:
+            add_self_in_exprs(c, n, ex->v.Tuple.elts, clazz);
+            break;
+        default:
+            break;
+    }
+    return NULL;
+}
+
+/* find the names in the given comprehension, and add self if they are defined in class body */
+static void
+add_self_in_comprehension(struct compiling *c, const node *n, asdl_seq* comps, const asdl_seq* clazz)
+{
+    expr_ty e;
+    int i;
+    for (i = 0; i < asdl_seq_LEN(comps); i++) {
+        comprehension_ty co = asdl_seq_GET(comps, i);
+        e = add_self_for_member_access(c, n, co->target, clazz);
+        if (e)
+            co->target = e;
+        e = add_self_for_member_access(c, n, co->iter, clazz);
+        if (e)
+            co->iter = e;
+        add_self_in_exprs(c, n, co->ifs, clazz);
+    }
+}
+
+/* find the names in the given exprs, and add self if they are defined in class body */
+static void
+add_self_in_exprs(struct compiling *c, const node *n, asdl_seq* exprs, const asdl_seq* clazz)
+{
+    int i;
+    for (i = 0; i < asdl_seq_LEN(exprs); i++) {
+        expr_ty e = asdl_seq_GET(exprs, i);
+        e = add_self_for_member_access(c, n, e, clazz);
+        if (e)
+            asdl_seq_SET(exprs, i, e);
+    }
+}
+
+/* find the names in the given keywords, and add self if they are defined in class body */
+static void
+add_self_in_keywords(struct compiling *c, const node *n, asdl_seq* keywords, const asdl_seq* clazz)
+{
+    expr_ty e;
+    int i;
+    for (i = 0; i < asdl_seq_LEN(keywords); i++) {
+        e = add_self_for_member_access(c, n, ((keyword_ty)asdl_seq_GET(keywords, i))->value, clazz);
+        if (e)
+            ((keyword_ty)asdl_seq_GET(keywords, i))->value = e;
+    }
+}
+
 static stmt_ty
 ast_for_update_classdef(struct compiling *c, const node *n,
                         PyObject *classname, expr_ty call, asdl_seq *body,
@@ -4093,6 +4311,10 @@ ast_for_update_classdef(struct compiling *c, const node *n,
                 /* find the fields that are read in pull_stmt */
                 asdl_seq *left = st->v.Pull.targets;
                 expr_ty right = st->v.Pull.value;
+                /* add self to name in right */
+                expr_ty e = add_self_for_member_access(c, n, right, body);
+                if (e)
+                    right = e;
 
                 D(printf("ast_for_update_classdef: len of left-hand side = %ld\n", asdl_seq_LEN(left)));
                 int j;
