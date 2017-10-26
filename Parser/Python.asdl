@@ -45,6 +45,7 @@ module Python
           | Raise(expr? exc, expr? cause)
           | Try(stmt* body, excepthandler* handlers, stmt* orelse, stmt* finalbody)
           | Assert(expr test, expr? msg)
+          | Pull(expr* targets, expr value)
 
           | Import(alias* names)
           | ImportFrom(identifier? module, alias* names, int? level)

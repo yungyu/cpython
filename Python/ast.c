@@ -12,6 +12,15 @@
 
 #include <assert.h>
 
+
+#ifdef Py_DEBUG
+extern int Py_DebugFlag;
+#define D(x) if (!Py_DebugFlag); else x
+#else
+#define D(x)
+#endif
+
+
 static int validate_stmts(asdl_seq *);
 static int validate_exprs(asdl_seq *, expr_context_ty, int);
 static int validate_nonempty_seq(asdl_seq *, const char *, const char *);
@@ -413,6 +422,9 @@ validate_stmt(stmt_ty stmt)
                (!stmt->v.AnnAssign.value ||
                 validate_expr(stmt->v.AnnAssign.value, Load)) &&
                validate_expr(stmt->v.AnnAssign.annotation, Load);
+    case Pull_kind:
+        return validate_assignlist(stmt->v.Pull.targets, Store) &&
+            validate_expr(stmt->v.Pull.value, Load);
     case For_kind:
         return validate_expr(stmt->v.For.target, Store) &&
             validate_expr(stmt->v.For.iter, Load) &&
@@ -606,6 +618,9 @@ static asdl_seq *ast_for_exprlist(struct compiling *, const node *,
                                   expr_context_ty);
 static expr_ty ast_for_testlist(struct compiling *, const node *);
 static stmt_ty ast_for_classdef(struct compiling *, const node *, asdl_seq *);
+static stmt_ty ast_for_update_classdef(struct compiling *, const node *,
+                                       PyObject *, expr_ty, asdl_seq *,
+                                       asdl_seq *, string);
 
 static stmt_ty ast_for_with_stmt(struct compiling *, const node *, int);
 static stmt_ty ast_for_for_stmt(struct compiling *, const node *, int);
@@ -3458,6 +3473,48 @@ ast_for_assert_stmt(struct compiling *c, const node *n)
     return NULL;
 }
 
+static stmt_ty
+ast_for_pull_stmt(struct compiling *c, const node *n)
+{
+    /* pull_stmt: 'pull' testlist_star_expr ('=' testlist_star_expr)* */
+    REQ(n, pull_stmt);
+    int i;
+    asdl_seq *targets;
+    node *value;
+    expr_ty expression;
+
+    /* a normal assignment, refer to ast_for_expr_stmt */
+    REQ(CHILD(n, 2), EQUAL);
+    targets = _Py_asdl_seq_new((NCH(n) - 1) / 2, c->c_arena);
+    if (!targets)
+        return NULL;
+    for (i = 1; i < NCH(n) - 2; i += 2) {
+        expr_ty e;
+        node *ch = CHILD(n, i);
+        if (TYPE(ch) == yield_expr) {
+            ast_error(c, ch, "assignment to yield expression not possible");
+            return NULL;
+        }
+        e = ast_for_testlist(c, ch);
+        if (!e)
+          return NULL;
+
+        /* set context to assign */
+        if (!set_context(c, e, Store, CHILD(n, i)))
+          return NULL;
+
+        asdl_seq_SET(targets, (i - 1) / 2, e);
+    }
+    value = CHILD(n, NCH(n) - 1);
+    if (TYPE(value) == testlist_star_expr)
+        expression = ast_for_testlist(c, value);
+    else
+        expression = ast_for_expr(c, value);
+    if (!expression)
+        return NULL;
+    return Pull(targets, expression, LINENO(n), n->n_col_offset, c->c_arena);
+}
+
 static asdl_seq *
 ast_for_suite(struct compiling *c, const node *n)
 {
@@ -3948,8 +4005,7 @@ ast_for_classdef(struct compiling *c, const node *n, asdl_seq *decorator_seq)
             return NULL;
         if (forbidden_name(c, classname, CHILD(n, 3), 0))
             return NULL;
-        return ClassDef(classname, NULL, NULL, s, decorator_seq, docstring,
-                        LINENO(n), n->n_col_offset, c->c_arena);
+        return ast_for_update_classdef(c, n, classname, NULL, s, decorator_seq, docstring);
     }
 
     if (TYPE(CHILD(n, 3)) == RPAR) { /* class NAME '(' ')' ':' suite */
@@ -3961,8 +4017,7 @@ ast_for_classdef(struct compiling *c, const node *n, asdl_seq *decorator_seq)
             return NULL;
         if (forbidden_name(c, classname, CHILD(n, 3), 0))
             return NULL;
-        return ClassDef(classname, NULL, NULL, s, decorator_seq, docstring,
-                        LINENO(n), n->n_col_offset, c->c_arena);
+        return ast_for_update_classdef(c, n, classname, NULL, s, decorator_seq, docstring);
     }
 
     /* class NAME '(' arglist ')' ':' suite */
@@ -3987,9 +4042,107 @@ ast_for_classdef(struct compiling *c, const node *n, asdl_seq *decorator_seq)
     if (forbidden_name(c, classname, CHILD(n, 1), 0))
         return NULL;
 
-    return ClassDef(classname, call->v.Call.args, call->v.Call.keywords, s,
-                    decorator_seq, docstring, LINENO(n), n->n_col_offset,
-                    c->c_arena);
+    return ast_for_update_classdef(c, n, classname, call, s, decorator_seq, docstring);
+}
+
+static stmt_ty
+ast_for_update_classdef(struct compiling *c, const node *n,
+                        PyObject *classname, expr_ty call, asdl_seq *body,
+                        asdl_seq *decorator_seq, string docstring)
+{
+    /* find out pull_stmt */
+
+    /* body is asdl_seq* returned by ast_for_sutie through ast_for_body */
+    int i;
+    /* calculate len of new classdef body first */
+    int len = asdl_seq_LEN(body);
+    int has_pull = 0;
+    for (i = 0; i < asdl_seq_LEN(body); i++) {
+        stmt_ty st = asdl_seq_GET(body, i);
+        if (st->kind == Pull_kind) {
+            has_pull = 1;
+            asdl_seq *left = st->v.Pull.targets;
+            //expr_ty right = st->v.Pull.value;
+            len = len - 1 + asdl_seq_LEN(left);
+        }
+    }
+
+    if (has_pull) {
+        D(printf("ast_for_update_classdef: updating classdef body (len: %ld -> %d)\n", asdl_seq_LEN(body), len));
+
+        /* add stmts in body to new body */
+        asdl_seq *nbody = _Py_asdl_seq_new(len, c->c_arena);
+        if (!nbody)
+            return NULL;
+        int idx = 0;
+        for (i = 0; i < asdl_seq_LEN(body); i++) {
+            stmt_ty s = asdl_seq_GET(body, i);
+            if (s->kind == Pull_kind)
+                continue;
+            asdl_seq_SET(nbody, idx, s);
+            idx++;
+        }
+
+        /* iterate again for update */
+        for (i = 0; i < asdl_seq_LEN(body); i++) {
+            stmt_ty st = asdl_seq_GET(body, i);
+            /* stmt is returned by ast_for_stmt  */
+            if (st->kind == Pull_kind) {
+                D(printf("ast_for_update_classdef: %d-th element is pull_stmt\n", i));
+
+                /* find the fields that are read in pull_stmt */
+                asdl_seq *left = st->v.Pull.targets;
+                expr_ty right = st->v.Pull.value;
+
+                D(printf("ast_for_update_classdef: len of left-hand side = %ld\n", asdl_seq_LEN(left)));
+                int j;
+                for (j = 0; j < asdl_seq_LEN(left); j++) {
+                    expr_ty ex = asdl_seq_GET(left, j);
+                    if (ex->kind == Name_kind) {
+                        /* add functiondef with @property for Name_kind */
+                        asdl_seq *fbody = _Py_asdl_seq_new(1, c->c_arena);
+                        if (!fbody)
+                            return NULL;
+                        asdl_seq_SET(fbody, 0, Return(right, LINENO(n), n->n_col_offset, c->c_arena));
+                        expr_ty deco = Name(new_identifier("property", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+                        asdl_seq *decos = _Py_asdl_seq_new(1, c->c_arena);
+                        asdl_seq_SET(decos, 0, deco);
+                        /* add self as the first arg */
+                        asdl_seq *posargs = _Py_asdl_seq_new(1, c->c_arena);
+                        if (!posargs)
+                            return NULL;
+                        arg_ty self = arg(new_identifier("self", c), NULL, LINENO(n), n->n_col_offset, c->c_arena);
+                        asdl_seq_SET(posargs, 0, self);
+                        arguments_ty args = arguments(posargs, NULL, NULL, NULL, NULL, NULL, c->c_arena);
+                        stmt_ty prop = FunctionDef(ex->v.Name.id, args, fbody, decos, NULL, NULL,
+                                                   LINENO(n), n->n_col_offset, c->c_arena);
+                        asdl_seq_SET(nbody, idx, prop);
+                        idx++;
+                        D(printf("ast_for_update_classdef: add property for %ls\n", PyUnicode_AS_UNICODE(ex->v.Name.id)));
+                    }
+                }
+            }
+
+        }
+        /* need to free body? */
+        body = nbody;
+    }
+
+
+    /* generate ClassDef */
+    asdl_seq *bases;
+    asdl_seq *keywords;
+    if (call) {
+        bases = call->v.Call.args;
+        keywords = call->v.Call.keywords;
+    }
+    else {
+        bases = NULL;
+        keywords = NULL;
+    }
+
+    return ClassDef(classname, bases, keywords, body, decorator_seq, docstring,
+                    LINENO(n), n->n_col_offset, c->c_arena);
 }
 
 static stmt_ty
@@ -4006,7 +4159,7 @@ ast_for_stmt(struct compiling *c, const node *n)
     if (TYPE(n) == small_stmt) {
         n = CHILD(n, 0);
         /* small_stmt: expr_stmt | del_stmt | pass_stmt | flow_stmt
-                  | import_stmt | global_stmt | nonlocal_stmt | assert_stmt
+                  | import_stmt | global_stmt | nonlocal_stmt | assert_stmt | pull_stmt
         */
         switch (TYPE(n)) {
             case expr_stmt:
@@ -4025,6 +4178,8 @@ ast_for_stmt(struct compiling *c, const node *n)
                 return ast_for_nonlocal_stmt(c, n);
             case assert_stmt:
                 return ast_for_assert_stmt(c, n);
+            case pull_stmt:
+                return ast_for_pull_stmt(c, n);
             default:
                 PyErr_Format(PyExc_SystemError,
                              "unhandled small_stmt: TYPE=%d NCH=%d\n",
