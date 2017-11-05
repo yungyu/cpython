@@ -422,6 +422,9 @@ validate_stmt(stmt_ty stmt)
                (!stmt->v.AnnAssign.value ||
                 validate_expr(stmt->v.AnnAssign.value, Load)) &&
                validate_expr(stmt->v.AnnAssign.annotation, Load);
+    case Push_kind:
+        return validate_assignlist(stmt->v.Push.targets, Store) &&
+            validate_expr(stmt->v.Push.value, Load);
     case Pull_kind:
         return validate_assignlist(stmt->v.Pull.targets, Store) &&
             validate_expr(stmt->v.Pull.value, Load);
@@ -3474,10 +3477,15 @@ ast_for_assert_stmt(struct compiling *c, const node *n)
 }
 
 static stmt_ty
-ast_for_pull_stmt(struct compiling *c, const node *n)
+ast_for_pushpull_stmt(struct compiling *c, const node *n, int is_pull)
 {
+    /* push_stmt: 'push' testlist_star_expr ('=' testlist_star_expr)* */
     /* pull_stmt: 'pull' testlist_star_expr ('=' testlist_star_expr)* */
-    REQ(n, pull_stmt);
+    if (is_pull)
+        REQ(n, pull_stmt);
+    else
+        REQ(n, push_stmt);
+        
     int i;
     asdl_seq *targets;
     node *value;
@@ -3512,7 +3520,10 @@ ast_for_pull_stmt(struct compiling *c, const node *n)
         expression = ast_for_expr(c, value);
     if (!expression)
         return NULL;
-    return Pull(targets, expression, LINENO(n), n->n_col_offset, c->c_arena);
+    if (is_pull)
+        return Pull(targets, expression, LINENO(n), n->n_col_offset, c->c_arena);
+    else
+        return Push(targets, expression, LINENO(n), n->n_col_offset, c->c_arena);
 }
 
 static asdl_seq *
@@ -4047,20 +4058,25 @@ ast_for_classdef(struct compiling *c, const node *n, asdl_seq *decorator_seq)
 
 /* return 1 if the given name exists in exprs */
 static int
-is_name_in_exprs(const identifier name, const asdl_seq* exprs)
+is_name_in_exprs(const identifier name, const asdl_seq *exprs, identifier replace_with)
 {
     int i;
     for (i = 0; i < asdl_seq_LEN(exprs); i++) {
         expr_ty ex = asdl_seq_GET(exprs, i);
-        if (ex->kind == Name_kind && PyUnicode_Compare(name, ex->v.Name.id) == 0)
+        if (ex->kind == Name_kind && PyUnicode_Compare(name, ex->v.Name.id) == 0) {
+            if (replace_with) {
+                D(printf("is_name_in_exprs: replace %s with %s\n", PyUnicode_AsUTF8(ex->v.Name.id), PyUnicode_AsUTF8(replace_with)));
+                ex->v.Name.id = replace_with;
+            }
             return 1;
+        }
     }
     return 0;
 }
 
 /* return 1 if the given name exists in stmts */
 static int
-is_name_in_stmts(const identifier name, const asdl_seq* stmts)
+is_name_in_stmts(const identifier name, const asdl_seq *stmts, int field_only, identifier replace_with)
 {
     int i;
     identifier id = NULL;
@@ -4068,7 +4084,7 @@ is_name_in_stmts(const identifier name, const asdl_seq* stmts)
         stmt_ty st = asdl_seq_GET(stmts, i);
         switch (st->kind) {
             case Assign_kind:
-                if (is_name_in_exprs(name, st->v.Assign.targets))
+                if (is_name_in_exprs(name, st->v.Assign.targets, replace_with))
                     return 1;
                 break;
             case AnnAssign_kind:
@@ -4076,13 +4092,16 @@ is_name_in_stmts(const identifier name, const asdl_seq* stmts)
                     return 1;
                 break;
             case FunctionDef_kind:
-                id = st->v.FunctionDef.name;
+                if (!field_only)
+                    id = st->v.FunctionDef.name;
                 break;
             case AsyncFunctionDef_kind:
-                id = st->v.AsyncFunctionDef.name;
+                if (!field_only)
+                    id = st->v.AsyncFunctionDef.name;
                 break;
             case ClassDef_kind:
-                id = st->v.ClassDef.name;
+                if (!field_only)
+                    id = st->v.ClassDef.name;
                 break;
             default:
                 continue;
@@ -4093,125 +4112,123 @@ is_name_in_stmts(const identifier name, const asdl_seq* stmts)
     return 0;
 }
 
-static void add_self_in_comprehension(struct compiling *c, const node *n, asdl_seq*, const asdl_seq*);
-static void add_self_in_exprs(struct compiling *c, const node *n, asdl_seq*, const asdl_seq*);
-static void add_self_in_keywords(struct compiling *c, const node *n, asdl_seq*, const asdl_seq*);
+typedef expr_ty (*visit_name_funcptr)(struct compiling *, const node *, const expr_ty, asdl_seq *, const asdl_seq *, int *);
+static void traverse_in_comprehension(struct compiling *, const node *, asdl_seq *, asdl_seq *, const asdl_seq *, visit_name_funcptr, const int *);
+static void traverse_in_exprs(struct compiling *, const node *, asdl_seq *, asdl_seq *, const asdl_seq *, visit_name_funcptr, const int *);
+static void traverse_in_keywords(struct compiling *, const node *, asdl_seq *, asdl_seq *, const asdl_seq *, visit_name_funcptr, const int *);
 /* find the names in the given expr, and add self if they are defined in class body */
 static expr_ty
-add_self_for_member_access(struct compiling *c, const node *n, expr_ty ex, const asdl_seq* clazz)
+traverse_for_name(struct compiling *c, const node *n, expr_ty ex, asdl_seq *clazz, const asdl_seq *refs,
+                  visit_name_funcptr apply, const int *count)
 {
     expr_ty e;
     switch (ex->kind) {
         case BoolOp_kind:
-            add_self_in_exprs(c, n, ex->v.BoolOp.values, clazz);
+            traverse_in_exprs(c, n, ex->v.BoolOp.values, clazz, refs, apply, count);
             break;
         case BinOp_kind:
-            e = add_self_for_member_access(c, n, ex->v.BinOp.left, clazz);
+            e = traverse_for_name(c, n, ex->v.BinOp.left, clazz, refs, apply, count);
             if (e)
                 ex->v.BinOp.left = e;
-            e = add_self_for_member_access(c, n, ex->v.BinOp.right, clazz);
+            e = traverse_for_name(c, n, ex->v.BinOp.right, clazz, refs, apply, count);
             if (e)
                 ex->v.BinOp.right = e;
             break;
         case UnaryOp_kind:
-            e = add_self_for_member_access(c, n, ex->v.UnaryOp.operand, clazz);
+            e = traverse_for_name(c, n, ex->v.UnaryOp.operand, clazz, refs, apply, count);
             if (e)
                 ex->v.UnaryOp.operand = e;
             break;
         case Lambda_kind:
-            e = add_self_for_member_access(c, n, ex->v.Lambda.body, clazz);
+            e = traverse_for_name(c, n, ex->v.Lambda.body, clazz, refs, apply, count);
             if (e)
                 ex->v.Lambda.body = e;
             break;
         case IfExp_kind:
             /* cannot write test here since it will be expanded
-             * add_self_for_member_access(c, n, ex->v.IfExp.test, clazz);
+             * traverse_for_name(c, n, ex->v.IfExp.test, clazz, refs, apply, count);
              */
-            e = add_self_for_member_access(c, n, ex->v.IfExp.body, clazz);
+            e = traverse_for_name(c, n, ex->v.IfExp.body, clazz, refs, apply, count);
             if (e)
                 ex->v.IfExp.body = e;
-            e = add_self_for_member_access(c, n, ex->v.IfExp.orelse, clazz);
+            e = traverse_for_name(c, n, ex->v.IfExp.orelse, clazz, refs, apply, count);
             if (e)
                 ex->v.IfExp.orelse = e;
             break;
         case Dict_kind:
-            add_self_in_exprs(c, n, ex->v.Dict.keys, clazz);
-            add_self_in_exprs(c, n, ex->v.Dict.values, clazz);
+            traverse_in_exprs(c, n, ex->v.Dict.keys, clazz, refs, apply, count);
+            traverse_in_exprs(c, n, ex->v.Dict.values, clazz, refs, apply, count);
             break;
         case Set_kind:
-            add_self_in_exprs(c, n, ex->v.Set.elts, clazz);
+            traverse_in_exprs(c, n, ex->v.Set.elts, clazz, refs, apply, count);
             break;
         case ListComp_kind:
-            e = add_self_for_member_access(c, n, ex->v.ListComp.elt, clazz);
+            e = traverse_for_name(c, n, ex->v.ListComp.elt, clazz, refs, apply, count);
             if (e)
                 ex->v.ListComp.elt = e;
-            add_self_in_comprehension(c, n, ex->v.ListComp.generators, clazz);
+            traverse_in_comprehension(c, n, ex->v.ListComp.generators, clazz, refs, apply, count);
             break;
         case SetComp_kind:
-            e = add_self_for_member_access(c, n, ex->v.SetComp.elt, clazz);
+            e = traverse_for_name(c, n, ex->v.SetComp.elt, clazz, refs, apply, count);
             if (e)
                 ex->v.SetComp.elt = e;
-            add_self_in_comprehension(c, n, ex->v.SetComp.generators, clazz);
+            traverse_in_comprehension(c, n, ex->v.SetComp.generators, clazz, refs, apply, count);
             break;
         case DictComp_kind:
-            e = add_self_for_member_access(c, n, ex->v.DictComp.key, clazz);
+            e = traverse_for_name(c, n, ex->v.DictComp.key, clazz, refs, apply, count);
             if (e)
                 ex->v.DictComp.key = e;
-            e = add_self_for_member_access(c, n, ex->v.DictComp.value, clazz);
+            e = traverse_for_name(c, n, ex->v.DictComp.value, clazz, refs, apply, count);
             if (e)
                 ex->v.DictComp.value = e;
-            add_self_in_comprehension(c, n, ex->v.DictComp.generators, clazz);
+            traverse_in_comprehension(c, n, ex->v.DictComp.generators, clazz, refs, apply, count);
             break;
         case GeneratorExp_kind:
-            e = add_self_for_member_access(c, n, ex->v.GeneratorExp.elt, clazz);
+            e = traverse_for_name(c, n, ex->v.GeneratorExp.elt, clazz, refs, apply, count);
             if (e)
                 ex->v.GeneratorExp.elt = e;
-            add_self_in_comprehension(c, n, ex->v.GeneratorExp.generators, clazz);
+            traverse_in_comprehension(c, n, ex->v.GeneratorExp.generators, clazz, refs, apply, count);
             break;
         case Compare_kind:
-            e = add_self_for_member_access(c, n, ex->v.Compare.left, clazz);
+            e = traverse_for_name(c, n, ex->v.Compare.left, clazz, refs, apply, count);
             if (e)
                 ex->v.Compare.left = e;
-            add_self_in_exprs(c, n, ex->v.Compare.comparators, clazz);
+            traverse_in_exprs(c, n, ex->v.Compare.comparators, clazz, refs, apply, count);
             break;
         case Call_kind:
-            e = add_self_for_member_access(c, n, ex->v.Call.func, clazz);
+            e = traverse_for_name(c, n, ex->v.Call.func, clazz, refs, apply, count);
             if (e)
                 ex->v.Call.func = e;
-            add_self_in_exprs(c, n, ex->v.Call.args, clazz);
-            add_self_in_keywords(c, n, ex->v.Call.keywords, clazz);
+            traverse_in_exprs(c, n, ex->v.Call.args, clazz, refs, apply, count);
+            traverse_in_keywords(c, n, ex->v.Call.keywords, clazz, refs, apply, count);
             break;
         case FormattedValue_kind:
-            e = add_self_for_member_access(c, n, ex->v.FormattedValue.value, clazz);
+            e = traverse_for_name(c, n, ex->v.FormattedValue.value, clazz, refs, apply, count);
             if (e)
                 ex->v.FormattedValue.value = e;
-            e = add_self_for_member_access(c, n, ex->v.FormattedValue.format_spec, clazz);
+            e = traverse_for_name(c, n, ex->v.FormattedValue.format_spec, clazz, refs, apply, count);
             if (e)
                 ex->v.FormattedValue.format_spec = e;
             break;
         case Subscript_kind:
-            e = add_self_for_member_access(c, n, ex->v.Subscript.value, clazz);
+            e = traverse_for_name(c, n, ex->v.Subscript.value, clazz, refs, apply, count);
             if (e)
                 ex->v.Subscript.value = e;
             break;
         case Starred_kind:
-            e = add_self_for_member_access(c, n, ex->v.Starred.value, clazz);
+            e = traverse_for_name(c, n, ex->v.Starred.value, clazz, refs, apply, count);
             if (e)
                 ex->v.Starred.value = e;
             break;
         case Name_kind:
-            if (is_name_in_stmts(ex->v.Name.id, clazz)) {
-                /* replace Name(id) with Attribute(self, id) */
-                D(printf("add_self_for_member_access: prepending self to an identifier: %ls\n", PyUnicode_AS_UNICODE(ex->v.Name.id)));
-                expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
-                return Attribute(self, ex->v.Name.id, Load, LINENO(n), n->n_col_offset, c->c_arena);
-            }
+            if (apply)
+                return (*apply)(c, n, ex, clazz, refs, (int *)count);
             break;
         case List_kind:
-            add_self_in_exprs(c, n, ex->v.List.elts, clazz);
+            traverse_in_exprs(c, n, ex->v.List.elts, clazz, refs, apply, count);
             break;
         case Tuple_kind:
-            add_self_in_exprs(c, n, ex->v.Tuple.elts, clazz);
+            traverse_in_exprs(c, n, ex->v.Tuple.elts, clazz, refs, apply, count);
             break;
         default:
             break;
@@ -4221,30 +4238,32 @@ add_self_for_member_access(struct compiling *c, const node *n, expr_ty ex, const
 
 /* find the names in the given comprehension, and add self if they are defined in class body */
 static void
-add_self_in_comprehension(struct compiling *c, const node *n, asdl_seq* comps, const asdl_seq* clazz)
+traverse_in_comprehension(struct compiling *c, const node *n, asdl_seq *comps, asdl_seq *clazz, const asdl_seq *refs,
+                          visit_name_funcptr apply, const int *count)
 {
     expr_ty e;
     int i;
     for (i = 0; i < asdl_seq_LEN(comps); i++) {
         comprehension_ty co = asdl_seq_GET(comps, i);
-        e = add_self_for_member_access(c, n, co->target, clazz);
+        e = traverse_for_name(c, n, co->target, clazz, refs, apply, count);
         if (e)
             co->target = e;
-        e = add_self_for_member_access(c, n, co->iter, clazz);
+        e = traverse_for_name(c, n, co->iter, clazz, refs, apply, count);
         if (e)
             co->iter = e;
-        add_self_in_exprs(c, n, co->ifs, clazz);
+        traverse_in_exprs(c, n, co->ifs, clazz, refs, apply, count);
     }
 }
 
 /* find the names in the given exprs, and add self if they are defined in class body */
 static void
-add_self_in_exprs(struct compiling *c, const node *n, asdl_seq* exprs, const asdl_seq* clazz)
+traverse_in_exprs(struct compiling *c, const node *n, asdl_seq *exprs, asdl_seq *clazz, const asdl_seq *refs,
+                  visit_name_funcptr apply, const int *count)
 {
     int i;
     for (i = 0; i < asdl_seq_LEN(exprs); i++) {
         expr_ty e = asdl_seq_GET(exprs, i);
-        e = add_self_for_member_access(c, n, e, clazz);
+        e = traverse_for_name(c, n, e, clazz, refs, apply, count);
         if (e)
             asdl_seq_SET(exprs, i, e);
     }
@@ -4252,15 +4271,331 @@ add_self_in_exprs(struct compiling *c, const node *n, asdl_seq* exprs, const asd
 
 /* find the names in the given keywords, and add self if they are defined in class body */
 static void
-add_self_in_keywords(struct compiling *c, const node *n, asdl_seq* keywords, const asdl_seq* clazz)
+traverse_in_keywords(struct compiling *c, const node *n, asdl_seq *keywords, asdl_seq *clazz, const asdl_seq *refs,
+                     visit_name_funcptr apply, const int *count)
 {
     expr_ty e;
     int i;
     for (i = 0; i < asdl_seq_LEN(keywords); i++) {
-        e = add_self_for_member_access(c, n, ((keyword_ty)asdl_seq_GET(keywords, i))->value, clazz);
+        e = traverse_for_name(c, n, ((keyword_ty)asdl_seq_GET(keywords, i))->value, clazz, refs, apply, count);
         if (e)
             ((keyword_ty)asdl_seq_GET(keywords, i))->value = e;
     }
+}
+
+static int
+count_written_fields(asdl_seq *targets, asdl_seq *clazz)
+{
+    int count = 0;
+    int i;
+    for (i = 0; i < asdl_seq_LEN(targets); i++) {
+        expr_ty ex = asdl_seq_GET(targets, i);
+        /* fail to update if the class already has members with the given names */
+        if (ex->kind == Name_kind) {
+            if (is_name_in_stmts(ex->v.Name.id, clazz, 1, NULL)) {
+                PyErr_Format(PyExc_SystemError, "member already exists: %s", PyUnicode_AsUTF8(ex->v.Name.id)); 
+                return -1;
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
+static expr_ty
+find_fields(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *refs, int *count)
+{
+    if (!is_name_in_stmts(ex->v.Name.id, clazz, 1, NULL))
+        return NULL;
+
+    D(printf("find_fields: found a field: %s\n", PyUnicode_AsUTF8(ex->v.Name.id)));
+    *count += 1;
+    return ex;
+}
+
+
+static int
+count_read_fields(expr_ty ex, asdl_seq *clazz)
+{
+    int count = 0;
+    traverse_for_name(NULL, NULL, ex, clazz, NULL, &find_fields, &count);
+    return count;
+}
+
+static asdl_seq *
+get_expanded_body_except(struct compiling *c, const asdl_seq *body, int len, int except)
+{
+    asdl_seq *nbody = _Py_asdl_seq_new(len, c->c_arena);
+    if (!nbody)
+        return NULL;
+
+    int i;
+    int idx = 0;
+    for (i = 0; i < asdl_seq_LEN(body); i++) {
+        stmt_ty s = asdl_seq_GET(body, i);
+        if (i == except)
+            continue;
+        asdl_seq_SET(nbody, idx, s);
+        idx++;
+    }
+    return nbody;
+}
+
+static stmt_ty
+get_property_funcdef(struct compiling *c, const node *n, identifier name, expr_ty ret)
+{
+    asdl_seq *fbody = _Py_asdl_seq_new(1, c->c_arena);
+    if (!fbody)
+        return NULL;
+
+    asdl_seq_SET(fbody, 0, Return(ret, LINENO(n), n->n_col_offset, c->c_arena));
+    expr_ty deco = Name(new_identifier("property", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq *decos = _Py_asdl_seq_new(1, c->c_arena);
+    asdl_seq_SET(decos, 0, deco);
+    /* add self as the first arg */
+    asdl_seq *posargs = _Py_asdl_seq_new(1, c->c_arena);
+    if (!posargs)
+        return NULL;
+    arg_ty self = arg(new_identifier("self", c), NULL, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(posargs, 0, self);
+    arguments_ty args = arguments(posargs, NULL, NULL, NULL, NULL, NULL, c->c_arena);
+    stmt_ty prop = FunctionDef(name, args, fbody, decos, NULL, NULL,
+                               LINENO(n), n->n_col_offset, c->c_arena);
+    return prop;
+}
+
+static stmt_ty
+get_setter_funcdef(struct compiling *c, const node *n, identifier from, identifier to, asdl_seq *adds)
+{
+    /* setter body: self.to = from */
+    asdl_seq *target = _Py_asdl_seq_new(1, c->c_arena);
+    if (!target)
+        return NULL;
+    expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty tex = Attribute(self, to, Store, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(target, 0, tex);
+    expr_ty fex = Name(from, Load, LINENO(n), n->n_col_offset, c->c_arena);
+
+    /* add stmts in adds if it is not NULL */
+    int len = 1;
+    if (adds)
+        len += asdl_seq_LEN(adds);
+    asdl_seq *fbody = _Py_asdl_seq_new(len, c->c_arena);
+    if (!fbody)
+        return NULL;
+    asdl_seq_SET(fbody, 0, Assign(target, fex, LINENO(n), n->n_col_offset, c->c_arena));
+    if (adds) {
+        int i;
+        for (i = 0; i < asdl_seq_LEN(adds); i++) {
+            stmt_ty st = asdl_seq_GET(adds, i);
+            asdl_seq_SET(fbody, 1 + i, st);
+        }
+    }
+
+    expr_ty fdeco = Name(from, Load, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty deco = Attribute(fdeco, new_identifier("setter", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq *decos = _Py_asdl_seq_new(1, c->c_arena);
+    asdl_seq_SET(decos, 0, deco);
+    /* add self as the first arg, from as the second arg */
+    asdl_seq *posargs = _Py_asdl_seq_new(2, c->c_arena);
+    if (!posargs)
+        return NULL;
+    arg_ty sarg = arg(new_identifier("self", c), NULL, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(posargs, 0, sarg);
+    arg_ty farg = arg(from, NULL, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(posargs, 1, farg);
+    arguments_ty args = arguments(posargs, NULL, NULL, NULL, NULL, NULL, c->c_arena);
+    stmt_ty setter = FunctionDef(from, args, fbody, decos, NULL, NULL,
+                                 LINENO(n), n->n_col_offset, c->c_arena);
+    return setter;
+}
+
+static stmt_ty
+get_updater_funcdef(struct compiling *c, const node *n, identifier name, expr_ty right)
+{
+    char buf[128];
+    sprintf(buf, "_update_%s", PyUnicode_AsUTF8(name));
+    identifier fname = new_identifier(buf, c);
+
+    /* updater body: self.name = right */
+    asdl_seq *target = _Py_asdl_seq_new(1, c->c_arena);
+    if (!target)
+        return NULL;
+    expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty assign = Attribute(self, name, Store, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(target, 0, assign);
+    asdl_seq *fbody = _Py_asdl_seq_new(1, c->c_arena);
+    if (!fbody)
+        return NULL;
+    asdl_seq_SET(fbody, 0, Assign(target, right, LINENO(n), n->n_col_offset, c->c_arena));
+
+    /* add self as the first arg */
+    asdl_seq *posargs = _Py_asdl_seq_new(1, c->c_arena);
+    if (!posargs)
+        return NULL;
+    arg_ty sarg = arg(new_identifier("self", c), NULL, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(posargs, 0, sarg);
+    arguments_ty args = arguments(posargs, NULL, NULL, NULL, NULL, NULL, c->c_arena);
+    stmt_ty updater = FunctionDef(fname, args, fbody, NULL, NULL, NULL,
+                                  LINENO(n), n->n_col_offset, c->c_arena);
+    return updater;
+}
+
+static expr_ty
+add_self_for_members(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *refs, int *count)
+{
+    if (!is_name_in_stmts(ex->v.Name.id, clazz, 0, NULL)){
+        return NULL;
+    }
+
+    /* replace Name(id) with Attribute(self, id) */
+    D(printf("add_self_for_members: prepending self to an identifier: %s\n", PyUnicode_AsUTF8(ex->v.Name.id)));
+    *count += 1;
+    expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    return Attribute(self, ex->v.Name.id, Load, LINENO(n), n->n_col_offset, c->c_arena);
+}
+
+static expr_ty
+add_property_and_setter_for_fields(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *targets, int *idx)
+{
+    /* prepend an underscore */
+    char buf[128];
+    sprintf(buf, "_%s", PyUnicode_AsUTF8(ex->v.Name.id));
+    if (!is_name_in_stmts(ex->v.Name.id, clazz, 0, new_identifier(buf, c)))
+        return NULL;
+    identifier nid = new_identifier(buf, c);
+    D(printf("add_property_and_setter_for_fields: renamed to: %s\n", PyUnicode_AsUTF8(nid)));
+    /* add property for fields */
+    expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty ret = Attribute(self, nid, Load, LINENO(n), n->n_col_offset, c->c_arena);
+    stmt_ty prop = get_property_funcdef(c, n, ex->v.Name.id, ret);
+    asdl_seq_SET(clazz, *idx, prop);
+    D(printf("add_property_and_setter_for_fields: added a property for %s at %d\n", PyUnicode_AsUTF8(ex->v.Name.id), *idx));
+    *idx += 1;
+    /* add setter for fields */
+    asdl_seq *adds = _Py_asdl_seq_new(asdl_seq_LEN(targets), c->c_arena);
+    int i;
+    for (i = 0; i < asdl_seq_LEN(targets); i++) {
+        expr_ty ex = asdl_seq_GET(targets, i);
+        assert(ex->kind == Name_kind);
+        char ubuf[128];
+        sprintf(ubuf, "_update_%s", PyUnicode_AsUTF8(ex->v.Name.id));
+        self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+        expr_ty uex = Attribute(self, new_identifier(ubuf, c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+        expr_ty ucall = Call(uex, NULL, NULL, LINENO(n), n->n_col_offset, c->c_arena);
+        asdl_seq_SET(adds, i, Expr(ucall, LINENO(n), n->n_col_offset, c->c_arena));
+    }
+    stmt_ty setter = get_setter_funcdef(c, n, new_identifier(PyUnicode_AsUTF8(ex->v.Name.id), c),
+                                        new_identifier(PyUnicode_AsUTF8(nid), c), adds);
+    asdl_seq_SET(clazz, *idx, setter);
+    D(printf("add_property_and_setter_for_fields: added a setter for %s at %d\n", PyUnicode_AsUTF8(ex->v.Name.id), *idx));
+    *idx += 1;
+    return Name(new_identifier(buf, c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+}
+
+static asdl_seq *
+update_body_for_push(struct compiling *c, const node *n, asdl_seq *body, int index)
+{
+    D(printf("update_body_for_push: updating body for stmt %d\n", index));
+
+    stmt_ty st = asdl_seq_GET(body, index);
+    assert(st->kind == Push_kind);
+    asdl_seq *left = st->v.Push.targets;
+    expr_ty right = st->v.Push.value;
+
+    /* check and count the fields that are written in push_stmt */
+    int len = asdl_seq_LEN(body);
+    int count = count_written_fields(left, body);
+    D(printf("update_body_for_push: found %d written fields at left-hand side\n", count));
+    len += count;
+
+    /* check and count the fields that are read in push_stmt */
+    count = count_read_fields(right, body);
+    D(printf("update_body_for_push: found %d read fields at right-hand side\n", count));
+    len += 2 * count;
+
+    /* add stmts in body to new body */
+    asdl_seq *nbody = get_expanded_body_except(c, body, len, index); 
+    if (!nbody)
+        return NULL;
+    /* all stmts in body except the push_stmt have been copied to nbody */
+    int idx = asdl_seq_LEN(body) - 1;
+    D(printf("update_body_for_push: len of original body = %ld, len of new body = %ld\n", asdl_seq_LEN(body), asdl_seq_LEN(nbody)));
+
+    /* add property and setter for name in right */
+    count = idx;
+    traverse_for_name(c, n, right, nbody, left, &add_property_and_setter_for_fields, &idx);
+    D(printf("update_body_for_push: add %d property/setter funcdefs\n", idx - count));
+
+    /* add self to name in right */
+    count = 0;
+    traverse_for_name(c, n, right, nbody, NULL, &add_self_for_members, &count);
+    D(printf("update_body_for_push: modified %d names at right-hand side\n", count));
+    /* add updater for name in left */
+    int i;
+    for (i = 0; i < asdl_seq_LEN(left); i++) {
+        expr_ty ex = asdl_seq_GET(left, i);
+        if (ex->kind == Name_kind) {
+            /* add functiondef for Name_kind */
+            stmt_ty func = get_updater_funcdef(c, n, ex->v.Name.id, right);
+            asdl_seq_SET(nbody, idx, func);
+            D(printf("update_body_for_push: add updater for %s at %d\n", PyUnicode_AsUTF8(ex->v.Name.id), idx));
+            idx++;
+        }
+    }
+
+    /* convert push_stmt to normal assign
+     * it should be initialized with a copy of right, but here simply assign them 0 */
+    PyObject *zero = parsenumber(c, "0");
+    expr_ty num = Num(zero, LINENO(n), n->n_col_offset, c->c_arena);
+    st = Assign(left, num, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(nbody, idx, st);
+
+    /* need to free body? */
+    return nbody;
+}
+
+static asdl_seq *
+update_body_for_pull(struct compiling *c, const node *n, asdl_seq *body, int index)
+{
+    D(printf("update_body_for_pull: updating body for stmt %d\n", index));
+
+    stmt_ty st = asdl_seq_GET(body, index);
+    assert(st->kind == Pull_kind);
+    asdl_seq *left = st->v.Pull.targets;
+    expr_ty right = st->v.Pull.value;
+
+    /* check and count the fields that are written in pull_stmt */
+    int len = asdl_seq_LEN(body) - 1;
+    len += count_written_fields(left, body);
+
+    /* add stmts in body to new body */
+    asdl_seq *nbody = get_expanded_body_except(c, body, len, index); 
+    if (!nbody)
+        return NULL;
+    /* all stmts in body except the pull_stmt have been copied to nbody */
+    int idx = asdl_seq_LEN(body) - 1;
+
+    /* add self to name in right */
+    int count = 0;
+    traverse_for_name(c, n, right, body, NULL, &add_self_for_members, &count);
+    D(printf("update_body_for_pull: modified %d names at right-hand side\n", count));
+
+    /* add property for name in left */
+    int i;
+    for (i = 0; i < asdl_seq_LEN(left); i++) {
+        expr_ty ex = asdl_seq_GET(left, i);
+        if (ex->kind == Name_kind) {
+            /* add functiondef with @property for Name_kind */
+            stmt_ty prop = get_property_funcdef(c, n, ex->v.Name.id, right);
+            asdl_seq_SET(nbody, idx, prop);
+            idx++;
+            D(printf("update_body_for_pull: add property for %s\n", PyUnicode_AsUTF8(ex->v.Name.id)));
+        }
+    }
+
+    /* need to free body? */
+    return nbody;
 }
 
 static stmt_ty
@@ -4268,88 +4603,25 @@ ast_for_update_classdef(struct compiling *c, const node *n,
                         PyObject *classname, expr_ty call, asdl_seq *body,
                         asdl_seq *decorator_seq, string docstring)
 {
-    /* find out pull_stmt */
+    /* find out push_stmt and pull_stmt */
 
     /* body is asdl_seq* returned by ast_for_sutie through ast_for_body */
-    int i;
-    /* calculate len of new classdef body first */
-    int len = asdl_seq_LEN(body);
-    int has_pull = 0;
-    for (i = 0; i < asdl_seq_LEN(body); i++) {
-        stmt_ty st = asdl_seq_GET(body, i);
-        if (st->kind == Pull_kind) {
-            has_pull = 1;
-            asdl_seq *left = st->v.Pull.targets;
-            //expr_ty right = st->v.Pull.value;
-            len = len - 1 + asdl_seq_LEN(left);
-        }
-    }
-
-    if (has_pull) {
-        D(printf("ast_for_update_classdef: updating classdef body (len: %ld -> %d)\n", asdl_seq_LEN(body), len));
-
-        /* add stmts in body to new body */
-        asdl_seq *nbody = _Py_asdl_seq_new(len, c->c_arena);
-        if (!nbody)
-            return NULL;
-        int idx = 0;
-        for (i = 0; i < asdl_seq_LEN(body); i++) {
-            stmt_ty s = asdl_seq_GET(body, i);
-            if (s->kind == Pull_kind)
-                continue;
-            asdl_seq_SET(nbody, idx, s);
-            idx++;
-        }
-
-        /* iterate again for update */
-        for (i = 0; i < asdl_seq_LEN(body); i++) {
-            stmt_ty st = asdl_seq_GET(body, i);
+    int i, len;
+    do {
+        len = asdl_seq_LEN(body);
+        for (i = 0; i < len; i++) {
             /* stmt is returned by ast_for_stmt  */
-            if (st->kind == Pull_kind) {
-                D(printf("ast_for_update_classdef: %d-th element is pull_stmt\n", i));
-
-                /* find the fields that are read in pull_stmt */
-                asdl_seq *left = st->v.Pull.targets;
-                expr_ty right = st->v.Pull.value;
-                /* add self to name in right */
-                expr_ty e = add_self_for_member_access(c, n, right, body);
-                if (e)
-                    right = e;
-
-                D(printf("ast_for_update_classdef: len of left-hand side = %ld\n", asdl_seq_LEN(left)));
-                int j;
-                for (j = 0; j < asdl_seq_LEN(left); j++) {
-                    expr_ty ex = asdl_seq_GET(left, j);
-                    if (ex->kind == Name_kind) {
-                        /* add functiondef with @property for Name_kind */
-                        asdl_seq *fbody = _Py_asdl_seq_new(1, c->c_arena);
-                        if (!fbody)
-                            return NULL;
-                        asdl_seq_SET(fbody, 0, Return(right, LINENO(n), n->n_col_offset, c->c_arena));
-                        expr_ty deco = Name(new_identifier("property", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
-                        asdl_seq *decos = _Py_asdl_seq_new(1, c->c_arena);
-                        asdl_seq_SET(decos, 0, deco);
-                        /* add self as the first arg */
-                        asdl_seq *posargs = _Py_asdl_seq_new(1, c->c_arena);
-                        if (!posargs)
-                            return NULL;
-                        arg_ty self = arg(new_identifier("self", c), NULL, LINENO(n), n->n_col_offset, c->c_arena);
-                        asdl_seq_SET(posargs, 0, self);
-                        arguments_ty args = arguments(posargs, NULL, NULL, NULL, NULL, NULL, c->c_arena);
-                        stmt_ty prop = FunctionDef(ex->v.Name.id, args, fbody, decos, NULL, NULL,
-                                                   LINENO(n), n->n_col_offset, c->c_arena);
-                        asdl_seq_SET(nbody, idx, prop);
-                        idx++;
-                        D(printf("ast_for_update_classdef: add property for %ls\n", PyUnicode_AS_UNICODE(ex->v.Name.id)));
-                    }
-                }
+            stmt_ty st = asdl_seq_GET(body, i);
+            if (st->kind == Push_kind) {
+                body = update_body_for_push(c, n, body, i);
+                break;
             }
-
+            else if (st->kind == Pull_kind) {
+                body = update_body_for_pull(c, n, body, i);
+                break;
+            }
         }
-        /* need to free body? */
-        body = nbody;
-    }
-
+    } while (i < len);
 
     /* generate ClassDef */
     asdl_seq *bases;
@@ -4400,8 +4672,10 @@ ast_for_stmt(struct compiling *c, const node *n)
                 return ast_for_nonlocal_stmt(c, n);
             case assert_stmt:
                 return ast_for_assert_stmt(c, n);
+            case push_stmt:
+                return ast_for_pushpull_stmt(c, n, 0);
             case pull_stmt:
-                return ast_for_pull_stmt(c, n);
+                return ast_for_pushpull_stmt(c, n, 1);
             default:
                 PyErr_Format(PyExc_SystemError,
                              "unhandled small_stmt: TYPE=%d NCH=%d\n",
