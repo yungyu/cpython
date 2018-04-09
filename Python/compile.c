@@ -2914,6 +2914,10 @@ compiler_visit_stmt(struct compiler *c, stmt_ty s)
     case Delete_kind:
         VISIT_SEQ(c, expr, s->v.Delete.targets)
         break;
+    case Push_kind:
+        return compiler_error(c, "'push' was not transformed well");
+    case Pull_kind:
+        return compiler_error(c, "'pull' was not transformed well");
     case Assign_kind:
         n = asdl_seq_LEN(s->v.Assign.targets);
         VISIT(c, expr, s->v.Assign.value);

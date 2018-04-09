@@ -405,6 +405,12 @@ validate_stmt(stmt_ty stmt)
         return !stmt->v.Return.value || validate_expr(stmt->v.Return.value, Load);
     case Delete_kind:
         return validate_assignlist(stmt->v.Delete.targets, Del);
+    case Push_kind:
+        return validate_assignlist(stmt->v.Push.targets, Store) &&
+            validate_expr(stmt->v.Push.value, Load);
+    case Pull_kind:
+        return validate_assignlist(stmt->v.Pull.targets, Store) &&
+            validate_expr(stmt->v.Pull.value, Load);
     case Assign_kind:
         return validate_assignlist(stmt->v.Assign.targets, Store) &&
             validate_expr(stmt->v.Assign.value, Load);
@@ -422,12 +428,6 @@ validate_stmt(stmt_ty stmt)
                (!stmt->v.AnnAssign.value ||
                 validate_expr(stmt->v.AnnAssign.value, Load)) &&
                validate_expr(stmt->v.AnnAssign.annotation, Load);
-    case Push_kind:
-        return validate_assignlist(stmt->v.Push.targets, Store) &&
-            validate_expr(stmt->v.Push.value, Load);
-    case Pull_kind:
-        return validate_assignlist(stmt->v.Pull.targets, Store) &&
-            validate_expr(stmt->v.Pull.value, Load);
     case For_kind:
         return validate_expr(stmt->v.For.target, Store) &&
             validate_expr(stmt->v.For.iter, Load) &&

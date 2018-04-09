@@ -1186,6 +1186,14 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
     case Delete_kind:
         VISIT_SEQ(st, expr, s->v.Delete.targets);
         break;
+    case Push_kind:
+        VISIT_SEQ(st, expr, s->v.Push.targets);
+        VISIT(st, expr, s->v.Push.value);
+        break;
+    case Pull_kind:
+        VISIT_SEQ(st, expr, s->v.Pull.targets);
+        VISIT(st, expr, s->v.Pull.value);
+        break;
     case Assign_kind:
         VISIT_SEQ(st, expr, s->v.Assign.targets);
         VISIT(st, expr, s->v.Assign.value);
