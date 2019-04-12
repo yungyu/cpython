@@ -20,6 +20,11 @@ extern int Py_DebugFlag;
 #define D(x)
 #endif
 
+#define PUPPYSIGN "_puppy_"
+#define PUPPY_UPDATER PUPPYSIGN "update_"
+#define PUPPY_FIELD   PUPPYSIGN "field_"
+#define PUPPY_WRAPPER PUPPYSIGN "wrapper_"
+
 
 static int validate_stmts(asdl_seq *);
 static int validate_exprs(asdl_seq *, expr_context_ty, int);
@@ -4058,13 +4063,13 @@ ast_for_classdef(struct compiling *c, const node *n, asdl_seq *decorator_seq)
 
 /* return 1 if the given name exists in exprs */
 static int
-is_name_in_exprs(const identifier name, const asdl_seq *exprs, identifier replace_with)
+is_name_in_exprs(struct compiling *c, const node *n, const identifier name, const asdl_seq *exprs, identifier replace_with)
 {
     int i;
     for (i = 0; i < asdl_seq_LEN(exprs); i++) {
         expr_ty ex = asdl_seq_GET(exprs, i);
         if (ex->kind == Name_kind && PyUnicode_Compare(name, ex->v.Name.id) == 0) {
-            if (replace_with) {
+            if (replace_with && strncmp(PyUnicode_AsUTF8(ex->v.Name.id), PUPPYSIGN, 1)) {
                 D(printf("is_name_in_exprs: replace %s with %s\n", PyUnicode_AsUTF8(ex->v.Name.id), PyUnicode_AsUTF8(replace_with)));
                 ex->v.Name.id = replace_with;
             }
@@ -4076,15 +4081,17 @@ is_name_in_exprs(const identifier name, const asdl_seq *exprs, identifier replac
 
 /* return 1 if the given name exists in stmts */
 static int
-is_name_in_stmts(const identifier name, const asdl_seq *stmts, int field_only, identifier replace_with)
+is_name_in_stmts(struct compiling *c, const node *n, const identifier name, const asdl_seq *stmts, int field_only, identifier replace_with)
 {
     int i;
     identifier id = NULL;
     for (i = 0; i < asdl_seq_LEN(stmts); i++) {
         stmt_ty st = asdl_seq_GET(stmts, i);
+        if (st == NULL)
+            continue;
         switch (st->kind) {
             case Assign_kind:
-                if (is_name_in_exprs(name, st->v.Assign.targets, replace_with))
+                if (is_name_in_exprs(c, n, name, st->v.Assign.targets, replace_with))
                     return 1;
                 break;
             case AnnAssign_kind:
@@ -4112,16 +4119,64 @@ is_name_in_stmts(const identifier name, const asdl_seq *stmts, int field_only, i
     return 0;
 }
 
+/* return 1 if the given property exists in stmts */
+static int
+is_property_in_stmts(struct compiling *c, const node *n, const identifier name, const asdl_seq *stmts, identifier add_after)
+{
+    char fbuf[128];
+    sprintf(fbuf, PUPPY_FIELD "%s", PyUnicode_AsUTF8(name));
+    if (is_name_in_stmts(c, n, new_identifier(fbuf, c), stmts, 1, NULL)) {
+        // this is a property created by puppy
+        D(printf("is_property_in_stmts: %s is a puppy property\n", PyUnicode_AsUTF8(name)));
+        return 0;
+    }
+
+    int i;
+    for (i = 0; i < asdl_seq_LEN(stmts); i++) {
+        stmt_ty st = asdl_seq_GET(stmts, i);
+        if (st && st->kind == FunctionDef_kind && !PyUnicode_Compare(st->v.FunctionDef.name, name)) {
+            asdl_seq *decos = st->v.FunctionDef.decorator_list;
+            int j;
+            int idx = -1;
+            for (j = 0; j < asdl_seq_LEN(decos); j++) {
+                expr_ty deco = asdl_seq_GET(decos, j);
+                if (deco->kind == Name_kind && (PyUnicode_CompareWithASCIIString(deco->v.Name.id, "property") == 0)) {
+                    idx = j;
+                    break;
+                }
+            }
+            if (idx < 0)
+                return 0;
+
+            if (add_after) {
+                expr_ty deco = Name(add_after, Load, LINENO(n), n->n_col_offset, c->c_arena);
+                asdl_seq *ndecos = _Py_asdl_seq_new(asdl_seq_LEN(decos) + 1, c->c_arena);
+                for (j = 0; j <= idx; j++) {
+                    asdl_seq_SET(ndecos, j, asdl_seq_GET(decos, j));
+                }
+                asdl_seq_SET(ndecos, idx + 1, deco);
+                for (j = idx + 2; j < asdl_seq_LEN(decos) + 1; j++) {
+                    asdl_seq_SET(ndecos, j, asdl_seq_GET(decos, j - 1));
+                }
+                st->v.FunctionDef.decorator_list = ndecos;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 typedef expr_ty (*visit_name_funcptr)(struct compiling *, const node *, const expr_ty, asdl_seq *, const asdl_seq *, int *);
 static void traverse_in_comprehension(struct compiling *, const node *, asdl_seq *, asdl_seq *, const asdl_seq *, visit_name_funcptr, const int *);
 static void traverse_in_exprs(struct compiling *, const node *, asdl_seq *, asdl_seq *, const asdl_seq *, visit_name_funcptr, const int *);
 static void traverse_in_keywords(struct compiling *, const node *, asdl_seq *, asdl_seq *, const asdl_seq *, visit_name_funcptr, const int *);
-/* find the names in the given expr, and add self if they are defined in class body */
+/* find the names in the given expr and apply visitor */
 static expr_ty
 traverse_for_name(struct compiling *c, const node *n, expr_ty ex, asdl_seq *clazz, const asdl_seq *refs,
                   visit_name_funcptr apply, const int *count)
 {
     expr_ty e;
+    expr_ty ret = ex;
     switch (ex->kind) {
         case BoolOp_kind:
             traverse_in_exprs(c, n, ex->v.BoolOp.values, clazz, refs, apply, count);
@@ -4146,7 +4201,9 @@ traverse_for_name(struct compiling *c, const node *n, expr_ty ex, asdl_seq *claz
             break;
         case IfExp_kind:
             /* cannot write test here since it will be expanded
-             * traverse_for_name(c, n, ex->v.IfExp.test, clazz, refs, apply, count);
+             * e = traverse_for_name(c, n, ex->v.IfExp.test, clazz, refs, apply, count);
+             * if (e)
+             *     ex->v.IfExp.test = e;
              */
             e = traverse_for_name(c, n, ex->v.IfExp.body, clazz, refs, apply, count);
             if (e)
@@ -4210,6 +4267,14 @@ traverse_for_name(struct compiling *c, const node *n, expr_ty ex, asdl_seq *claz
             if (e)
                 ex->v.FormattedValue.format_spec = e;
             break;
+        case Attribute_kind:
+            if (apply) {
+                e = traverse_for_name(c, n, ex->v.Attribute.value, clazz, refs, apply, count);
+                if (e && e != ex && e->kind == Attribute_kind) {
+                    ex->v.Attribute.value = e;
+                }
+            }
+            break;
         case Subscript_kind:
             e = traverse_for_name(c, n, ex->v.Subscript.value, clazz, refs, apply, count);
             if (e)
@@ -4233,7 +4298,7 @@ traverse_for_name(struct compiling *c, const node *n, expr_ty ex, asdl_seq *claz
         default:
             break;
     }
-    return NULL;
+    return ret;
 }
 
 /* find the names in the given comprehension, and add self if they are defined in class body */
@@ -4292,7 +4357,7 @@ count_written_fields(asdl_seq *targets, asdl_seq *clazz)
         expr_ty ex = asdl_seq_GET(targets, i);
         /* fail to update if the class already has members with the given names */
         if (ex->kind == Name_kind) {
-            if (is_name_in_stmts(ex->v.Name.id, clazz, 1, NULL)) {
+            if (is_name_in_stmts(NULL, NULL, ex->v.Name.id, clazz, 1, NULL)) {
                 PyErr_Format(PyExc_SystemError, "member already exists: %s", PyUnicode_AsUTF8(ex->v.Name.id)); 
                 return -1;
             }
@@ -4305,14 +4370,13 @@ count_written_fields(asdl_seq *targets, asdl_seq *clazz)
 static expr_ty
 find_fields(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *refs, int *count)
 {
-    if (!is_name_in_stmts(ex->v.Name.id, clazz, 1, NULL))
+    if (!is_name_in_stmts(c, n, ex->v.Name.id, clazz, 1, NULL))
         return NULL;
 
     D(printf("find_fields: found a field: %s\n", PyUnicode_AsUTF8(ex->v.Name.id)));
     *count += 1;
     return ex;
 }
-
 
 static int
 count_read_fields(expr_ty ex, asdl_seq *clazz)
@@ -4322,15 +4386,34 @@ count_read_fields(expr_ty ex, asdl_seq *clazz)
     return count;
 }
 
+static expr_ty
+find_properties(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *refs, int *count)
+{
+    if (!is_property_in_stmts(c, n, ex->v.Name.id, clazz, NULL))
+        return NULL;
+
+    D(printf("find_properties: found a property: %s\n", PyUnicode_AsUTF8(ex->v.Name.id)));
+    *count += 1;
+    return ex;
+}
+
+static int
+count_read_properties(struct compiling *c, const node *n, expr_ty ex, asdl_seq *clazz)
+{
+    int count = 0;
+    traverse_for_name(c, n, ex, clazz, NULL, &find_properties, &count);
+    return count;
+}
+
 static asdl_seq *
-get_expanded_body_except(struct compiling *c, const asdl_seq *body, int len, int except)
+get_expanded_body_except(struct compiling *c, const asdl_seq *body, int len, int except, int shift)
 {
     asdl_seq *nbody = _Py_asdl_seq_new(len, c->c_arena);
     if (!nbody)
         return NULL;
 
     int i;
-    int idx = 0;
+    int idx = shift;
     for (i = 0; i < asdl_seq_LEN(body); i++) {
         stmt_ty s = asdl_seq_GET(body, i);
         if (i == except)
@@ -4411,10 +4494,80 @@ get_setter_funcdef(struct compiling *c, const node *n, identifier from, identifi
 }
 
 static stmt_ty
+get_wrapper_funcdef(struct compiling *c, const node *n, identifier name, const char *fbuf, asdl_seq *adds)
+{
+    /* wrapper body:
+     * def name(f):
+     *     def wrapper(self):
+     *         self.fid = f(self)
+     *         adds
+     *         return self.fid
+     *     return wrapper
+     */
+    asdl_seq *fbody = _Py_asdl_seq_new(2, c->c_arena);
+    if (!fbody)
+        return NULL;
+
+    /* prepare inner funcdef: wrapper */
+    asdl_seq *ibody = _Py_asdl_seq_new(asdl_seq_LEN(adds) + 2, c->c_arena);
+    if (!ibody)
+        return NULL;
+    /* self.fid = f(self) */
+    asdl_seq *target = _Py_asdl_seq_new(1, c->c_arena);
+    if (!target)
+        return NULL;
+    expr_ty lself = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty tex = Attribute(lself, new_identifier(fbuf, c), Store, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(target, 0, tex);
+    asdl_seq *fargs = _Py_asdl_seq_new(1, c->c_arena);
+    if (!fargs)
+        return NULL;
+    asdl_seq_SET(fargs, 0, Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena));
+    expr_ty fex = Name(new_identifier("f", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty fself = Call(fex, fargs, NULL, LINENO(n), n->n_col_offset, c->c_arena);
+
+    asdl_seq_SET(ibody, 0, Assign(target, fself, LINENO(n), n->n_col_offset, c->c_arena));
+    if (adds) {
+        int i;
+        for (i = 0; i < asdl_seq_LEN(adds); i++) {
+            stmt_ty st = asdl_seq_GET(adds, i);
+            asdl_seq_SET(ibody, 1 + i, st);
+        }
+    }
+    expr_ty rself = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty iret = Attribute(rself, new_identifier(fbuf, c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(ibody, asdl_seq_LEN(adds) + 1, Return(iret, LINENO(n), n->n_col_offset, c->c_arena));
+    asdl_seq *iposargs = _Py_asdl_seq_new(1, c->c_arena);
+    if (!iposargs)
+        return NULL;
+    arg_ty aself = arg(new_identifier("self", c), NULL, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(iposargs, 0, aself);
+    arguments_ty iargs = arguments(iposargs, NULL, NULL, NULL, NULL, NULL, c->c_arena);
+    stmt_ty inner = FunctionDef(new_identifier("wrapper", c), iargs, ibody, NULL, NULL, NULL,
+                                LINENO(n), n->n_col_offset, c->c_arena);
+
+    asdl_seq_SET(fbody, 0, inner);
+
+    /* return wrapper */
+    expr_ty ret = Name(new_identifier("wrapper", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(fbody, 1, Return(ret, LINENO(n), n->n_col_offset, c->c_arena));
+    /* add f as the first arg */
+    asdl_seq *posargs = _Py_asdl_seq_new(1, c->c_arena);
+    if (!posargs)
+        return NULL;
+    arg_ty af = arg(new_identifier("f", c), NULL, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq_SET(posargs, 0, af);
+    arguments_ty args = arguments(posargs, NULL, NULL, NULL, NULL, NULL, c->c_arena);
+    stmt_ty prop = FunctionDef(name, args, fbody, NULL, NULL, NULL,
+                               LINENO(n), n->n_col_offset, c->c_arena);
+    return prop;
+}
+
+static stmt_ty
 get_updater_funcdef(struct compiling *c, const node *n, identifier name, expr_ty right)
 {
     char buf[128];
-    sprintf(buf, "_update_%s", PyUnicode_AsUTF8(name));
+    sprintf(buf, PUPPY_UPDATER "%s", PyUnicode_AsUTF8(name));
     identifier fname = new_identifier(buf, c);
 
     /* updater body: self.name = right */
@@ -4444,7 +4597,7 @@ get_updater_funcdef(struct compiling *c, const node *n, identifier name, expr_ty
 static expr_ty
 add_self_for_members(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *refs, int *count)
 {
-    if (!is_name_in_stmts(ex->v.Name.id, clazz, 0, NULL)){
+    if (!is_name_in_stmts(c, n, ex->v.Name.id, clazz, 0, NULL)){
         return NULL;
     }
 
@@ -4455,36 +4608,95 @@ add_self_for_members(struct compiling *c, const node *n, const expr_ty ex, asdl_
     return Attribute(self, ex->v.Name.id, Load, LINENO(n), n->n_col_offset, c->c_arena);
 }
 
+/* return 1 if add stmts to the given function successfully */
+static int
+add_stmts_to_setter(struct compiling *c, const identifier name, const asdl_seq *clazz, asdl_seq *adds)
+{
+    int i;
+    for (i = 0; i < asdl_seq_LEN(clazz); i++) {
+        stmt_ty st = asdl_seq_GET(clazz, i);
+        if (st && st->kind == FunctionDef_kind && !PyUnicode_Compare(st->v.FunctionDef.name, name)) {
+            /* there must be a setter deco */
+            asdl_seq *decos = st->v.FunctionDef.decorator_list;
+            int j;
+            int idx = -1;
+            for (j = 0; j < asdl_seq_LEN(decos); j++) {
+                expr_ty deco = asdl_seq_GET(decos, j);
+                if (deco->kind == Attribute_kind && (PyUnicode_CompareWithASCIIString(deco->v.Attribute.attr, "setter") == 0)) {
+                    expr_ty v = deco->v.Attribute.value;
+                    if (v->kind == Name_kind && (PyUnicode_Compare(v->v.Name.id, name) == 0)) {
+                        idx = j;
+                        break;
+                    }
+                }
+            }
+            if (idx >= 0) {
+                /* append adds to its body */
+                int olen = asdl_seq_LEN(st->v.FunctionDef.body);
+                int alen = asdl_seq_LEN(adds);
+                int nlen = olen + alen;
+                asdl_seq *nbody = get_expanded_body_except(c, st->v.FunctionDef.body, nlen, -1, 0); 
+                int j;
+                for (j = olen; j < nlen; j++) {
+                    asdl_seq_SET(nbody, j, asdl_seq_GET(adds, j - olen));
+                }
+                st->v.FunctionDef.body = nbody;
+                D(printf("add_stmts_to_setter: add %d stmts to %s\n", alen, PyUnicode_AsUTF8(st->v.FunctionDef.name)));
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static expr_ty
 add_property_and_setter_for_fields(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *targets, int *idx)
 {
+    /* ignore puppy fields */
+    if (strncmp(PyUnicode_AsUTF8(ex->v.Name.id), PUPPY_FIELD, strlen(PUPPY_FIELD)) == 0)
+        return NULL;
+
     /* prepend an underscore */
     char buf[128];
-    sprintf(buf, "_%s", PyUnicode_AsUTF8(ex->v.Name.id));
-    if (!is_name_in_stmts(ex->v.Name.id, clazz, 0, new_identifier(buf, c)))
-        return NULL;
+    sprintf(buf, PUPPY_FIELD "%s", PyUnicode_AsUTF8(ex->v.Name.id));
     identifier nid = new_identifier(buf, c);
-    D(printf("add_property_and_setter_for_fields: renamed to: %s\n", PyUnicode_AsUTF8(nid)));
-    /* add property for fields */
-    expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
-    expr_ty ret = Attribute(self, nid, Load, LINENO(n), n->n_col_offset, c->c_arena);
-    stmt_ty prop = get_property_funcdef(c, n, ex->v.Name.id, ret);
-    asdl_seq_SET(clazz, *idx, prop);
-    D(printf("add_property_and_setter_for_fields: added a property for %s at %d\n", PyUnicode_AsUTF8(ex->v.Name.id), *idx));
-    *idx += 1;
-    /* add setter for fields */
+    int has_setter = 0;
+    if (!is_name_in_stmts(c, n, ex->v.Name.id, clazz, 1, nid)) {
+        if (!is_name_in_stmts(c, n, nid, clazz, 1, NULL))
+            return NULL;
+        /* have to find out the setter and add updater in it */
+        has_setter = 1;
+    }
+    if (!has_setter) {
+        D(printf("add_property_and_setter_for_fields: renamed to: %s\n", PyUnicode_AsUTF8(nid)));
+        /* add property for fields */
+        expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+        expr_ty ret = Attribute(self, nid, Load, LINENO(n), n->n_col_offset, c->c_arena);
+        stmt_ty prop = get_property_funcdef(c, n, ex->v.Name.id, ret);
+        asdl_seq_SET(clazz, *idx, prop);
+        D(printf("add_property_and_setter_for_fields: added a property for %s at %d\n", PyUnicode_AsUTF8(ex->v.Name.id), *idx));
+        *idx += 1;
+    }
+    /* prepare calls to updaters */
     asdl_seq *adds = _Py_asdl_seq_new(asdl_seq_LEN(targets), c->c_arena);
     int i;
     for (i = 0; i < asdl_seq_LEN(targets); i++) {
-        expr_ty ex = asdl_seq_GET(targets, i);
-        assert(ex->kind == Name_kind);
+        expr_ty e = asdl_seq_GET(targets, i);
+        assert(e->kind == Name_kind);
         char ubuf[128];
-        sprintf(ubuf, "_update_%s", PyUnicode_AsUTF8(ex->v.Name.id));
-        self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+        sprintf(ubuf, PUPPY_UPDATER "%s", PyUnicode_AsUTF8(e->v.Name.id));
+        expr_ty self = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
         expr_ty uex = Attribute(self, new_identifier(ubuf, c), Load, LINENO(n), n->n_col_offset, c->c_arena);
         expr_ty ucall = Call(uex, NULL, NULL, LINENO(n), n->n_col_offset, c->c_arena);
         asdl_seq_SET(adds, i, Expr(ucall, LINENO(n), n->n_col_offset, c->c_arena));
+        D(printf("add_property_and_setter_for_fields: prepare call to %s\n", ubuf));
     }
+    if (has_setter) {
+        add_stmts_to_setter(c, ex->v.Name.id, clazz, adds);
+        return NULL;
+    }
+    
+    /* add setter for fields */
     stmt_ty setter = get_setter_funcdef(c, n, new_identifier(PyUnicode_AsUTF8(ex->v.Name.id), c),
                                         new_identifier(PyUnicode_AsUTF8(nid), c), adds);
     asdl_seq_SET(clazz, *idx, setter);
@@ -4492,6 +4704,197 @@ add_property_and_setter_for_fields(struct compiling *c, const node *n, const exp
     *idx += 1;
     return Name(new_identifier(buf, c), Load, LINENO(n), n->n_col_offset, c->c_arena);
 }
+
+static expr_ty
+add_wrapper_for_properties(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *targets, int *idx)
+{
+    /* prepare the name of wrapper */
+    char buf[128];
+    sprintf(buf, PUPPY_WRAPPER "%s", PyUnicode_AsUTF8(ex->v.Name.id));
+    if (!is_property_in_stmts(c, n, ex->v.Name.id, clazz, new_identifier(buf, c)))
+        return NULL;
+    identifier nid = new_identifier(buf, c);
+    D(printf("add_wrapper_for_properties: appended @%s for %s\n", PyUnicode_AsUTF8(nid), PyUnicode_AsUTF8(ex->v.Name.id)));
+    /* add wrapper for properties */
+    asdl_seq *adds = _Py_asdl_seq_new(asdl_seq_LEN(targets), c->c_arena);
+    int i;
+    for (i = 0; i < asdl_seq_LEN(targets); i++) {
+        expr_ty e = asdl_seq_GET(targets, i);
+        assert(e->kind == Name_kind);
+        char ubuf[128];
+        sprintf(ubuf, PUPPY_UPDATER "%s", PyUnicode_AsUTF8(e->v.Name.id));
+        expr_ty uself = Name(new_identifier("self", c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+        expr_ty uex = Attribute(uself, new_identifier(ubuf, c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+        expr_ty ucall = Call(uex, NULL, NULL, LINENO(n), n->n_col_offset, c->c_arena);
+        asdl_seq_SET(adds, i, Expr(ucall, LINENO(n), n->n_col_offset, c->c_arena));
+    }
+    /* prepare the name of field returned by the wrapper */
+    char fbuf[128];
+    sprintf(fbuf, PUPPY_FIELD "%s", PyUnicode_AsUTF8(ex->v.Name.id));
+    stmt_ty wrapper = get_wrapper_funcdef(c, n, nid, fbuf, adds);
+    asdl_seq_SET(clazz, *idx, wrapper);
+    D(printf("add_wrapper_for_properties: added a wrapper for %s at %d\n", PyUnicode_AsUTF8(ex->v.Name.id), *idx));
+    *idx += 1;
+    PyObject *zero = parsenumber(c, "0");
+    expr_ty num = Num(zero, LINENO(n), n->n_col_offset, c->c_arena);
+    expr_ty rf = Name(new_identifier(fbuf, c), Store, LINENO(n), n->n_col_offset, c->c_arena);
+    asdl_seq *ts = _Py_asdl_seq_new(1, c->c_arena);
+    asdl_seq_SET(ts, 0, rf);
+    asdl_seq_SET(clazz, *idx, Assign(ts, num, LINENO(n), n->n_col_offset, c->c_arena));
+    D(printf("add_wrapper_for_properties: added a field %s for being used in wrapper at %d\n", fbuf, *idx));
+    *idx += 1;
+    return Name(new_identifier(fbuf, c), Load, LINENO(n), n->n_col_offset, c->c_arena);
+}
+
+static asdl_seq* deepcopy_asdl_seq(struct compiling *c, asdl_seq *from)
+{
+    int len = asdl_seq_LEN(from);
+    asdl_seq *copy = _Py_asdl_seq_new(len, c->c_arena);
+    if (copy) {
+        int i;
+        for (i = 0; i < len; i++) {
+            asdl_seq_SET(copy, i, from);
+        }
+    }
+    return copy;
+}
+
+/*
+static expr_ty
+deepcopy_expr(struct compiling *c, const node *n, expr_ty ex, asdl_seq *clazz)
+{
+    PyObject *obj = NULL;
+    char buf[128];
+    expr_ty expr1 = NULL;
+    expr_ty expr2 = NULL;
+    expr_ty copy = NULL;
+    D(printf("deepcopy_expr: %d\n", ex->kind));
+    switch (ex->kind) {
+//        case BoolOp_kind:
+//            boolop_ty op;
+//            asdl_seq *values;
+//            break;
+        case BinOp_kind:
+            expr1 = deepcopy_expr(c, n, ex->v.BinOp.left, clazz);
+            expr2 = deepcopy_expr(c, n, ex->v.BinOp.right, clazz);
+            copy = BinOp(expr1, ex->v.BinOp.op, expr2, LINENO(n), n->n_col_offset, c->c_arena);
+            break;
+//        case UnaryOp_kind:
+//            unaryop_ty op;
+//            expr_ty operand;
+//            break;
+//        case Lambda_kind:
+//            arguments_ty args;
+//            expr_ty body;
+//            break;
+//        case IfExp_kind:
+//            expr_ty test;
+//            expr_ty body;
+//            expr_ty orelse;
+//            break;
+//        case Dict_kind:
+//            asdl_seq *keys;
+//            asdl_seq *values;
+//            break;
+//        case Set_kind:
+//            asdl_seq *elts;
+//            break;
+//        case ListComp_kind:
+//            expr_ty elt;
+//            asdl_seq *generators;
+//            break;
+//        case SetComp_kind:
+//            expr_ty elt;
+//            asdl_seq *generators;
+//            break;
+//        case DictComp_kind:
+//            expr_ty key;
+//            expr_ty value;
+//            asdl_seq *generators;
+//            break;
+//        case GeneratorExp_kind:
+//            expr_ty elt;
+//            asdl_seq *generators;
+//            break;
+//        case Await_kind:
+//            expr_ty value;
+//            break;
+//        case Yield_kind:
+//            expr_ty value;
+//            break;
+//        case YieldFrom_kind:
+//            expr_ty value;
+//            break;
+//        case Compare_kind:
+//            expr_ty left;
+//            asdl_int_seq *ops;
+//            asdl_seq *comparators;
+//            break;
+//        case Call_kind:
+//            expr_ty func;
+//            asdl_seq *args;
+//            asdl_seq *keywords;
+//            break;
+        case Num_kind:
+            //obj = parsenumber(c, ex->v.Num.n);
+            //copy = Num(obj, LINENO(n), n->n_col_offset, c->c_arena);
+            break;
+//        case Str_kind:
+//            string s;
+//            break;
+//        case FormattedValue_kind:
+//            expr_ty value;
+//            int conversion;
+//            expr_ty format_spec;
+//            break;
+//        case JoinedStr_kind:
+//            asdl_seq *values;
+//            break;
+//        case Bytes_kind:
+//            bytes s;
+//            break;
+//        case NameConstant_kind:
+//            singleton value;
+//            break;
+//        case Constant_kind:
+//            constant value;
+//            break;
+//        case Attribute_kind:
+//            expr_ty value;
+//            identifier attr;
+//            expr_context_ty ctx;
+//            break;
+//        case Subscript_kind:
+//            expr_ty value;
+//            slice_ty slice;
+//            expr_context_ty ctx;
+//            break;
+//        case Starred_kind:
+//            expr_ty value;
+//            expr_context_ty ctx;
+//            break;
+        case Name_kind:
+            obj = new_identifier(PyUnicode_AsUTF8(ex->v.Name.id), c);
+            if (!is_name_in_stmts(c, n, obj, clazz, 1, NULL)) {
+                sprintf(buf, PUPPY_FIELD "%s", PyUnicode_AsUTF8(ex->v.Name.id));
+                obj = new_identifier(buf, c);
+            }
+            copy = Name(obj, ex->v.Name.ctx, LINENO(n), n->n_col_offset, c->c_arena);
+            break;
+//        case List_kind:
+//            asdl_seq *elts;
+//            expr_context_ty ctx;
+//            break;
+//        case Tuple_kind:
+//            asdl_seq *elts;
+//            expr_context_ty ctx;
+            break;
+        default:
+            return NULL;
+    }
+    return copy;
+}
+*/
 
 static asdl_seq *
 update_body_for_push(struct compiling *c, const node *n, asdl_seq *body, int index)
@@ -4507,29 +4910,52 @@ update_body_for_push(struct compiling *c, const node *n, asdl_seq *body, int ind
     int len = asdl_seq_LEN(body);
     int count = count_written_fields(left, body);
     D(printf("update_body_for_push: found %d written fields at left-hand side\n", count));
+    /* to add updater for write fields */
     len += count;
 
     /* check and count the fields that are read in push_stmt */
-    count = count_read_fields(right, body);
-    D(printf("update_body_for_push: found %d read fields at right-hand side\n", count));
-    len += 2 * count;
+    int fcount = count_read_fields(right, body);
+    D(printf("update_body_for_push: found %d read fields at right-hand side\n", fcount));
+    /* to add property and setter for read fields */
+    len += 2 * fcount;
+
+    /* check and count the properties that are read in push_stmt */
+    int pcount = count_read_properties(c, n, right, body);
+    D(printf("update_body_for_push: found %d read properties at right-hand side\n", pcount));
+    /* to add wrapper and the renamed field for read properties */
+    len += 2 * pcount;
 
     /* add stmts in body to new body */
-    asdl_seq *nbody = get_expanded_body_except(c, body, len, index); 
+    asdl_seq *nbody = get_expanded_body_except(c, body, len, index, 2 * pcount); 
     if (!nbody)
         return NULL;
     /* all stmts in body except the push_stmt have been copied to nbody */
-    int idx = asdl_seq_LEN(body) - 1;
+    int idx = asdl_seq_LEN(body) - 1 + 2 * pcount;
     D(printf("update_body_for_push: len of original body = %ld, len of new body = %ld\n", asdl_seq_LEN(body), asdl_seq_LEN(nbody)));
 
-    /* add property and setter for name in right */
+    /* add wrapper for properties in right */
+    if (pcount) {
+        int tmp = 0;
+        traverse_for_name(c, n, right, nbody, left, &add_wrapper_for_properties, &tmp);
+        D(printf("update_body_for_push: add %d wrapper funcdefs and fields\n", tmp));
+    }
+
+    /* add property and setter for fields in right */
     count = idx;
     traverse_for_name(c, n, right, nbody, left, &add_property_and_setter_for_fields, &idx);
     D(printf("update_body_for_push: add %d property/setter funcdefs\n", idx - count));
 
+    /* try to prepare a copy of right for initialization */
+    expr_ty copy = NULL; // TODO: deepcopy_expr(c, n, right, nbody);
+    if (!copy) {
+        /* simply assign them 0 if it cannot be copied well */
+        PyObject *zero = parsenumber(c, "0");
+        copy = Num(zero, LINENO(n), n->n_col_offset, c->c_arena);
+    }
+
     /* add self to name in right */
     count = 0;
-    traverse_for_name(c, n, right, nbody, NULL, &add_self_for_members, &count);
+    right = traverse_for_name(c, n, right, nbody, NULL, &add_self_for_members, &count);
     D(printf("update_body_for_push: modified %d names at right-hand side\n", count));
     /* add updater for name in left */
     int i;
@@ -4544,11 +4970,8 @@ update_body_for_push(struct compiling *c, const node *n, asdl_seq *body, int ind
         }
     }
 
-    /* convert push_stmt to normal assign
-     * it should be initialized with a copy of right, but here simply assign them 0 */
-    PyObject *zero = parsenumber(c, "0");
-    expr_ty num = Num(zero, LINENO(n), n->n_col_offset, c->c_arena);
-    st = Assign(left, num, LINENO(n), n->n_col_offset, c->c_arena);
+    /* convert push_stmt to normal assign */
+    st = Assign(left, copy, LINENO(n), n->n_col_offset, c->c_arena);
     asdl_seq_SET(nbody, idx, st);
 
     /* need to free body? */
@@ -4570,7 +4993,7 @@ update_body_for_pull(struct compiling *c, const node *n, asdl_seq *body, int ind
     len += count_written_fields(left, body);
 
     /* add stmts in body to new body */
-    asdl_seq *nbody = get_expanded_body_except(c, body, len, index); 
+    asdl_seq *nbody = get_expanded_body_except(c, body, len, index, 0); 
     if (!nbody)
         return NULL;
     /* all stmts in body except the pull_stmt have been copied to nbody */
@@ -4578,7 +5001,7 @@ update_body_for_pull(struct compiling *c, const node *n, asdl_seq *body, int ind
 
     /* add self to name in right */
     int count = 0;
-    traverse_for_name(c, n, right, body, NULL, &add_self_for_members, &count);
+    right = traverse_for_name(c, n, right, body, NULL, &add_self_for_members, &count);
     D(printf("update_body_for_pull: modified %d names at right-hand side\n", count));
 
     /* add property for name in left */
