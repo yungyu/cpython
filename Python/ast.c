@@ -4121,11 +4121,11 @@ is_name_in_stmts(struct compiling *c, const node *n, const identifier name, cons
 
 /* return 1 if the given property exists in stmts */
 static int
-is_property_in_stmts(struct compiling *c, const node *n, const identifier name, const asdl_seq *stmts, identifier add_after)
+is_property_in_stmts(struct compiling *c, const node *n, const identifier name, const asdl_seq *stmts, int nonpuppy_only, identifier add_after)
 {
     char fbuf[128];
     sprintf(fbuf, PUPPY_FIELD "%s", PyUnicode_AsUTF8(name));
-    if (is_name_in_stmts(c, n, new_identifier(fbuf, c), stmts, 1, NULL)) {
+    if (nonpuppy_only && is_name_in_stmts(c, n, new_identifier(fbuf, c), stmts, 1, NULL)) {
         // this is a property created by puppy
         D(printf("is_property_in_stmts: %s is a puppy property\n", PyUnicode_AsUTF8(name)));
         return 0;
@@ -4389,7 +4389,7 @@ count_read_fields(expr_ty ex, asdl_seq *clazz)
 static expr_ty
 find_properties(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *refs, int *count)
 {
-    if (!is_property_in_stmts(c, n, ex->v.Name.id, clazz, NULL))
+    if (!is_property_in_stmts(c, n, ex->v.Name.id, clazz, 1, NULL))
         return NULL;
 
     D(printf("find_properties: found a property: %s\n", PyUnicode_AsUTF8(ex->v.Name.id)));
@@ -4402,6 +4402,24 @@ count_read_properties(struct compiling *c, const node *n, expr_ty ex, asdl_seq *
 {
     int count = 0;
     traverse_for_name(c, n, ex, clazz, NULL, &find_properties, &count);
+    return count;
+}
+
+static expr_ty
+find_all_properties(struct compiling *c, const node *n, const expr_ty ex, asdl_seq *clazz, const asdl_seq *refs, int *count)
+{
+    if (!is_property_in_stmts(c, n, ex->v.Name.id, clazz, 0, NULL))
+        return NULL;
+
+    *count += 1;
+    return ex;
+}
+
+static int
+count_all_read_properties(struct compiling *c, const node *n, expr_ty ex, asdl_seq *clazz)
+{
+    int count = 0;
+    traverse_for_name(c, n, ex, clazz, NULL, &find_all_properties, &count);
     return count;
 }
 
@@ -4711,7 +4729,7 @@ add_wrapper_for_properties(struct compiling *c, const node *n, const expr_ty ex,
     /* prepare the name of wrapper */
     char buf[128];
     sprintf(buf, PUPPY_WRAPPER "%s", PyUnicode_AsUTF8(ex->v.Name.id));
-    if (!is_property_in_stmts(c, n, ex->v.Name.id, clazz, new_identifier(buf, c)))
+    if (!is_property_in_stmts(c, n, ex->v.Name.id, clazz, 1, new_identifier(buf, c)))
         return NULL;
     identifier nid = new_identifier(buf, c);
     D(printf("add_wrapper_for_properties: appended @%s for %s\n", PyUnicode_AsUTF8(nid), PyUnicode_AsUTF8(ex->v.Name.id)));
@@ -4921,9 +4939,16 @@ update_body_for_push(struct compiling *c, const node *n, asdl_seq *body, int ind
 
     /* check and count the properties that are read in push_stmt */
     int pcount = count_read_properties(c, n, right, body);
+    int acount = count_all_read_properties(c, n, right, body);
     D(printf("update_body_for_push: found %d read properties at right-hand side\n", pcount));
     /* to add wrapper and the renamed field for read properties */
     len += 2 * pcount;
+
+    if (fcount == 0 && acount == 0) {
+        st = Assign(left, right, LINENO(n), n->n_col_offset, c->c_arena);
+        asdl_seq_SET(body, index, st);
+        return body;
+    }
 
     /* add stmts in body to new body */
     asdl_seq *nbody = get_expanded_body_except(c, body, len, index, 2 * pcount); 
