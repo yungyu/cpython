@@ -4939,12 +4939,14 @@ update_body_for_push(struct compiling *c, const node *n, asdl_seq *body, int ind
 
     /* check and count the properties that are read in push_stmt */
     int pcount = count_read_properties(c, n, right, body);
+    /* count all the properties that are read in push_stmt including the ones created by puppy */
     int acount = count_all_read_properties(c, n, right, body);
     D(printf("update_body_for_push: found %d read properties at right-hand side\n", pcount));
     /* to add wrapper and the renamed field for read properties */
     len += 2 * pcount;
 
     if (fcount == 0 && acount == 0) {
+        /* fall back push_stmt to normal assign */
         st = Assign(left, right, LINENO(n), n->n_col_offset, c->c_arena);
         asdl_seq_SET(body, index, st);
         return body;
